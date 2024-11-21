@@ -7,12 +7,12 @@ from torch import Tensor, nn
 from transformers import PreTrainedTokenizerBase
 
 from steering_vectors.aggregators import Aggregator, mean_aggregator
-from steering_vectors.token_utils import adjust_read_indices_for_padding, fix_pad_token
+from steering_vectors.token_utils import fix_pad_token
 from steering_vectors.utils import batchify
 
 from .layer_matching import LayerType, ModelLayerConfig, guess_and_enhance_layer_config
-from .record_activations import record_activations
 from .steering_vector import SteeringVector
+from .train_utils import extract_activations_raw, get_token_index
 
 
 @dataclass
@@ -82,7 +82,7 @@ def extract_activations(
         for training_sample in batch:
             pos_prompts.append(training_sample.positive_str)
             pos_indices.append(
-                _get_token_index(
+                get_token_index(
                     training_sample.read_positive_token_index,
                     read_token_index,
                     training_sample.positive_str,
@@ -90,13 +90,13 @@ def extract_activations(
             )
             neg_prompts.append(training_sample.negative_str)
             neg_indices.append(
-                _get_token_index(
+                get_token_index(
                     training_sample.read_negative_token_index,
                     read_token_index,
                     training_sample.negative_str,
                 )
             )
-        pos_acts = _extract_activations(
+        pos_acts = extract_activations_raw(
             model,
             tokenizer,
             pos_prompts,
@@ -105,7 +105,7 @@ def extract_activations(
             layers=layers,
             read_token_indices=pos_indices,
         )
-        neg_acts = _extract_activations(
+        neg_acts = extract_activations_raw(
             model,
             tokenizer,
             neg_prompts,
@@ -222,42 +222,3 @@ def _formalize_sample(
         return SteeringVectorTrainingSample(sample[0], sample[1])
     else:
         return sample
-
-
-def _extract_activations(
-    model: nn.Module,
-    tokenizer: PreTrainedTokenizerBase,
-    prompts: Sequence[str],
-    layer_type: LayerType,
-    layer_config: ModelLayerConfig,
-    layers: list[int] | None,
-    read_token_indices: Sequence[int],
-) -> dict[int, Tensor]:
-    input = tokenizer(prompts, return_tensors="pt", padding=True)
-    adjusted_read_indices = adjust_read_indices_for_padding(
-        torch.tensor(read_token_indices), input["attention_mask"]
-    )
-    batch_indices = torch.arange(len(prompts))
-    results = {}
-    with record_activations(
-        model, layer_type, layer_config, layer_nums=layers
-    ) as record:
-        model(**input.to(model.device))
-    for layer_num, activation in record.items():
-        results[layer_num] = activation[-1][
-            batch_indices.to(activation[-1].device),
-            adjusted_read_indices.to(activation[-1].device),
-        ].detach()
-    return results
-
-
-def _get_token_index(
-    custom_idx: int | None, default_idx: int | Callable[[str], int], prompt: str
-) -> int:
-    if custom_idx is None:
-        if isinstance(default_idx, int):
-            return default_idx
-        else:
-            return default_idx(prompt)
-    else:
-        return custom_idx
