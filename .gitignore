@@ -174,3 +174,6 @@ lightning_logs/
 # dependency management
 poetry.lock
 pdm.lock
+
+.python-version
+pyrightconfig.json
