@@ -26,6 +26,10 @@ from .train_steering_vector import (
     extract_activations,
     train_steering_vector,
 )
+from .unsupervised_train_steering_vector import (
+    extract_activations_single,
+    unsupervised_train_steering_vector,
+)
 
 __all__ = [
     "Aggregator",
@@ -42,9 +46,11 @@ __all__ = [
     "SteeringVector",
     "SteeringPatchHandle",
     "train_steering_vector",
+    "unsupervised_train_steering_vector",
     "SteeringVectorTrainingSample",
     "aggregate_activations",
     "extract_activations",
+    "extract_activations_single",
     "ablation_operator",
     "addition_operator",
     "ablation_then_addition_operator",
