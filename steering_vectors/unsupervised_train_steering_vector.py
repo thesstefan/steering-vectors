@@ -25,15 +25,6 @@ class LossFn(Protocol):
     ) -> Tensor: ...
 
 
-def get_melbo_loss_fn(p: int, q: int) -> LossFn:
-    def loss_fn(base_activations: Tensor, steered_activations: Tensor) -> Tensor:
-        diff = base_activations - steered_activations
-
-        return -diff.norm(dim=1).pow(p).sum().pow(1 / q)
-
-    return loss_fn
-
-
 def extract_activations_single(
     model: nn.Module,
     tokenizer: PreTrainedTokenizerBase,
@@ -174,6 +165,7 @@ def optimize_steering_objective(
 def unsupervised_train_steering_vector(
     model: nn.Module,
     tokenizer: PreTrainedTokenizerBase,
+    loss_fn: LossFn,
     training_prompts: Sequence[str],
     source_layer: int,
     target_layer: int,
@@ -209,7 +201,7 @@ def unsupervised_train_steering_vector(
         model=model,
         tokenizer=tokenizer,
         training_prompts=training_prompts,
-        loss_fn=get_melbo_loss_fn(p=2, q=2),
+        loss_fn=loss_fn,
         source_acts_by_layer=base_activations_by_layer,
         source_layer=source_layer,
         target_layer=target_layer,
