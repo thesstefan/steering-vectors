@@ -1,10 +1,8 @@
 from collections import defaultdict
-from collections.abc import Callable, Sequence
-from typing import Protocol
+from collections.abc import Callable, Iterable, Sequence
 
 import torch
 from torch import Tensor, nn
-from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -19,10 +17,19 @@ from .train_utils import extract_activations_raw, get_token_index
 from .utils import batchify
 
 
-class LossFn(Protocol):
-    def __call__(
-        self, base_activations: Tensor, steered_activations: Tensor
-    ) -> Tensor: ...
+# TODO(stefanache): Basically taken from the MELBO implementation.
+#                   Figure out if it can be done in a better way.
+def project_to_orthogonal_subspace(
+    vec: Tensor, subspace: Tensor, magnitude: float
+) -> Tensor:
+    U = subspace.t() / magnitude
+    return vec - U @ U.t() @ vec
+
+
+def project_to_sphere_tangent_space(
+    vec: Tensor, point_on_shpere: Tensor, radius: float
+) -> Tensor:
+    return vec - point_on_shpere * (point_on_shpere @ vec) / radius
 
 
 def extract_activations_single(
@@ -79,12 +86,14 @@ def extract_activations_single(
 def optimize_steering_objective(
     model: nn.Module,
     tokenizer: PreTrainedTokenizerBase,
-    loss_fn: LossFn,
+    loss_fn: Callable[[Tensor, Tensor], Tensor],
+    create_optimizer_fn: Callable[[Iterable[torch.Tensor]], torch.optim.Optimizer],
     training_prompts: Sequence[str],
     source_acts_by_layer: dict[int, Tensor],
     source_layer: int,
     target_layer: int,
-    num_vectors: int = 1,
+    learned_vectors: torch.Tensor,
+    vec_magnitude: float = 1.0,
     num_steps: int = 50,
     layer_type: LayerType = "decoder_block",
     read_token_index: int | Callable[[str], int] = -1,
@@ -93,82 +102,90 @@ def optimize_steering_objective(
     batch_size: int = 1,
     move_to_cpu: bool = False,
     tqdm_desc: str = "Training steering vector",
-) -> tuple[list[SteeringVector], list[list[float]]]:
-    all_losses: list[list[float]] = []
-    steering_vectors: list[SteeringVector] = []
+) -> tuple[torch.Tensor, list[float]]:
+    layer_width = source_acts_by_layer[source_layer][0].shape[-1]
 
-    for vec_i in tqdm(range(num_vectors)):
-        losses: list[float] = []
-        optimized_steering_vector = nn.Parameter(
-            torch.rand(
-                source_acts_by_layer[source_layer][0].shape[-1],
-                device=next(model.parameters()).device,
+    optimized_steering_vector = nn.Parameter(
+        nn.functional.normalize(
+            project_to_orthogonal_subspace(
+                torch.rand(layer_width, device=next(model.parameters()).device),
+                subspace=learned_vectors,
+                magnitude=vec_magnitude,
             ),
+            dim=0,
         )
-        optimizer = AdamW(
-            [optimized_steering_vector],
-            lr=1e-3,
-            betas=(0.9, 0.98),
-            weight_decay=0.0,
-            amsgrad=True,
-        )
+        * vec_magnitude,
+    )
+    optimizer = create_optimizer_fn([optimized_steering_vector])
 
-        for step in range(num_steps):
-            optimizer.zero_grad()
+    loss_history: list[float] = []
+    for step in range(num_steps):
+        optimizer.zero_grad()
 
-            steering_vector = SteeringVector(
-                {source_layer: optimized_steering_vector},
-                layer_type,
-            )
-
-            with steering_vector.apply(model):
-                steered_activations = extract_activations_single(
-                    model,
-                    tokenizer,
-                    training_prompts,
-                    layers=[target_layer],
-                    layer_type=layer_type,
-                    layer_config=layer_config,
-                    move_to_cpu=move_to_cpu,
-                    read_token_index=read_token_index,
-                    show_progress=show_progress,
-                    batch_size=batch_size,
-                    tqdm_desc=tqdm_desc,
-                    no_grad=False,
-                )
-
-            loss = loss_fn(
-                source_acts_by_layer[target_layer], steered_activations[target_layer]
-            )
-            _ = loss.backward()
-            _ = optimizer.step()
-
-            with torch.no_grad():
-                optimized_steering_vector.data = nn.functional.normalize(
-                    optimized_steering_vector.data, dim=0
-                )
-
-                losses.append(loss.detach().item())
-
-        steering_vectors.append(
-            SteeringVector(
-                {source_layer: optimized_steering_vector.data.detach()},
-                layer_type,
-            )
+        steering_vector = SteeringVector(
+            {source_layer: optimized_steering_vector},
+            layer_type,
         )
 
-        all_losses.append(losses)
+        with steering_vector.apply(model):
+            steered_activations = extract_activations_single(
+                model,
+                tokenizer,
+                training_prompts,
+                layers=[target_layer],
+                layer_type=layer_type,
+                layer_config=layer_config,
+                move_to_cpu=move_to_cpu,
+                read_token_index=read_token_index,
+                show_progress=show_progress,
+                batch_size=batch_size,
+                tqdm_desc=tqdm_desc,
+                no_grad=False,
+            )
 
-    return steering_vectors, all_losses
+        loss = loss_fn(
+            source_acts_by_layer[target_layer], steered_activations[target_layer]
+        )
+
+        _ = loss.backward()
+
+        with torch.no_grad():
+            assert optimized_steering_vector.grad is not None
+
+            optimized_steering_vector.grad = project_to_sphere_tangent_space(
+                vec=project_to_orthogonal_subspace(
+                    optimized_steering_vector.grad,
+                    subspace=learned_vectors,
+                    magnitude=vec_magnitude,
+                ),
+                point_on_shpere=optimized_steering_vector.data,
+                radius=vec_magnitude,
+            )
+
+        _ = optimizer.step()
+
+        with torch.no_grad():
+            optimized_steering_vector.data = nn.functional.normalize(
+                optimized_steering_vector.data, dim=0
+            )
+            loss_history.append(float(loss.detach().item()))
+
+    return (
+        optimized_steering_vector.data.detach(),
+        loss_history,
+    )
 
 
 def unsupervised_train_steering_vector(
     model: nn.Module,
     tokenizer: PreTrainedTokenizerBase,
-    loss_fn: LossFn,
     training_prompts: Sequence[str],
     source_layer: int,
     target_layer: int,
+    loss_fn: Callable[[Tensor, Tensor], Tensor],
+    create_optimizer_fn: Callable[[Iterable[torch.Tensor]], torch.optim.Optimizer],
+    num_steps: int = 50,
+    num_vectors: int = 1,
     layer_type: LayerType = "decoder_block",
     layer_config: ModelLayerConfig | None = None,
     move_to_cpu: bool = False,
@@ -176,11 +193,8 @@ def unsupervised_train_steering_vector(
     show_progress: bool = False,
     batch_size: int = 1,
     tqdm_desc: str = "Training steering vector",
-) -> tuple[list[SteeringVector], list[list[float]]]:
+) -> list[tuple[SteeringVector, list[float]]]:
     layer_config = guess_and_enhance_layer_config(model, layer_config, layer_type)
-
-    for param in model.parameters():
-        param.requires_grad = False
 
     base_activations_by_layer = extract_activations_single(
         model=model,
@@ -197,19 +211,42 @@ def unsupervised_train_steering_vector(
         no_grad=False,
     )
 
-    return optimize_steering_objective(
-        model=model,
-        tokenizer=tokenizer,
-        training_prompts=training_prompts,
-        loss_fn=loss_fn,
-        source_acts_by_layer=base_activations_by_layer,
-        source_layer=source_layer,
-        target_layer=target_layer,
-        layer_type=layer_type,
-        layer_config=layer_config,
-        move_to_cpu=move_to_cpu,
-        read_token_index=read_token_index,
-        show_progress=show_progress,
-        batch_size=batch_size,
-        tqdm_desc=tqdm_desc,
+    layer_width = base_activations_by_layer[source_layer][0].shape[-1]
+    learned_vectors = torch.zeros(
+        num_vectors,
+        layer_width,
+        device=next(model.parameters()).device,
     )
+
+    vectors_and_losses: list[tuple[SteeringVector, list[float]]] = []
+    for vec_i in tqdm(range(num_vectors)):
+        raw_steering_vector, loss_history = optimize_steering_objective(
+            model=model,
+            tokenizer=tokenizer,
+            training_prompts=training_prompts,
+            learned_vectors=learned_vectors,
+            loss_fn=loss_fn,
+            create_optimizer_fn=create_optimizer_fn,
+            num_steps=num_steps,
+            source_acts_by_layer=base_activations_by_layer,
+            source_layer=source_layer,
+            target_layer=target_layer,
+            layer_type=layer_type,
+            layer_config=layer_config,
+            move_to_cpu=move_to_cpu,
+            read_token_index=read_token_index,
+            show_progress=show_progress,
+            batch_size=batch_size,
+            tqdm_desc=tqdm_desc,
+        )
+
+        learned_vectors[vec_i, :] = raw_steering_vector
+
+        vectors_and_losses.append(
+            (
+                SteeringVector({source_layer: raw_steering_vector}, layer_type),
+                loss_history,
+            )
+        )
+
+    return vectors_and_losses
